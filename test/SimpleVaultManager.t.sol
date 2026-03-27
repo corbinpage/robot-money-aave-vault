@@ -13,6 +13,7 @@ import {ERC20} from "@solmate/tokens/ERC20.sol";
 contract MockAToken is ERC20 {
     constructor() ERC20("Aave Base USDC", "aBasUSDC", 6) {}
     function mint(address to, uint256 amount) external { _mint(to, amount); }
+    function burn(address from, uint256 amount) external { _burn(from, amount); }
 }
 
 contract MockUSDC is ERC20 {
@@ -20,8 +21,11 @@ contract MockUSDC is ERC20 {
     function mint(address to, uint256 amount) external { _mint(to, amount); }
 }
 
-/// @dev Mock Aave Pool: supply burns USDC from caller and mints aUSDC to onBehalfOf.
-///      withdraw burns aUSDC from caller and mints USDC to recipient.
+/// @dev Mock Aave Pool that more accurately models real Aave V3 behavior.
+///      supply: pulls USDC from caller, mints aUSDC to onBehalfOf.
+///      withdraw: burns aUSDC directly from msg.sender (no transferFrom/approval needed),
+///               mints USDC to recipient. This matches real Aave V3 where the Pool
+///               has internal burn authority on aTokens.
 contract MockAavePool {
     MockUSDC public usdc;
     MockAToken public aUsdc;
@@ -37,10 +41,10 @@ contract MockAavePool {
     }
 
     function withdraw(address, uint256 amount, address to) external returns (uint256) {
-        // If max, withdraw all
         uint256 bal = aUsdc.balanceOf(msg.sender);
         uint256 withdrawAmount = amount == type(uint256).max ? bal : amount;
-        aUsdc.transferFrom(msg.sender, address(0xdead), withdrawAmount);
+        // Real Aave burns aTokens directly -- no approval needed from the holder
+        aUsdc.burn(msg.sender, withdrawAmount);
         usdc.mint(to, withdrawAmount);
         return withdrawAmount;
     }
@@ -51,6 +55,8 @@ contract MockAavePool {
 contract SimpleVaultManagerTest is Test {
     event SuppliedToAave(uint256 amount);
     event WithdrawnFromAave(uint256 amount);
+    event PauseToggled(bool isPaused);
+    event Rescued(address indexed token, address indexed to, uint256 amount);
 
     BoringVault vault;
     RolesAuthority rolesAuthority;
@@ -59,28 +65,30 @@ contract SimpleVaultManagerTest is Test {
     MockAToken aUsdc;
     MockAavePool aavePool;
 
-    address owner = address(0xA);
-    address manager = address(0xB);
+    address admin = address(0xA);
+    address operator = address(0xB);
 
     uint8 constant VAULT_MANAGER_ROLE = 1;
-    uint8 constant OWNER_ROLE = 8;
+    uint8 constant OPERATOR_ROLE = 8;
+    uint8 constant ADMIN_ROLE = 9;
 
     function setUp() public {
         usdc = new MockUSDC();
         aUsdc = new MockAToken();
         aavePool = new MockAavePool(usdc, aUsdc);
 
-        rolesAuthority = new RolesAuthority(owner, Authority(address(0)));
-        vault = new BoringVault(owner, "Robot Money Aave Vault", "rmUSDC", 6);
+        rolesAuthority = new RolesAuthority(admin, Authority(address(0)));
+        vault = new BoringVault(admin, "Robot Money Aave Vault", "rmUSDC", 6);
 
-        vm.prank(owner);
+        vm.prank(admin);
         vault.setAuthority(rolesAuthority);
 
+        // No Auth owner -- access is purely role-based
         vaultManager = new SimpleVaultManager(
-            owner, rolesAuthority, vault, address(usdc), address(aavePool)
+            rolesAuthority, vault, address(usdc), address(aavePool)
         );
 
-        vm.startPrank(owner);
+        vm.startPrank(admin);
 
         // SimpleVaultManager gets VAULT_MANAGER_ROLE on vault
         rolesAuthority.setUserRole(address(vaultManager), VAULT_MANAGER_ROLE, true);
@@ -91,16 +99,25 @@ contract SimpleVaultManagerTest is Test {
             true
         );
 
-        // Manager EOA gets OWNER_ROLE on vaultManager
-        rolesAuthority.setUserRole(manager, OWNER_ROLE, true);
+        // Operator gets OPERATOR_ROLE on vaultManager
+        rolesAuthority.setUserRole(operator, OPERATOR_ROLE, true);
         rolesAuthority.setRoleCapability(
-            OWNER_ROLE, address(vaultManager), SimpleVaultManager.supplyToAave.selector, true
+            OPERATOR_ROLE, address(vaultManager), SimpleVaultManager.supplyToAave.selector, true
         );
         rolesAuthority.setRoleCapability(
-            OWNER_ROLE, address(vaultManager), SimpleVaultManager.withdrawFromAave.selector, true
+            OPERATOR_ROLE, address(vaultManager), SimpleVaultManager.withdrawFromAave.selector, true
         );
         rolesAuthority.setRoleCapability(
-            OWNER_ROLE, address(vaultManager), SimpleVaultManager.withdrawAllFromAave.selector, true
+            OPERATOR_ROLE, address(vaultManager), SimpleVaultManager.withdrawAllFromAave.selector, true
+        );
+
+        // Admin gets ADMIN_ROLE for pause and rescue
+        rolesAuthority.setUserRole(admin, ADMIN_ROLE, true);
+        rolesAuthority.setRoleCapability(
+            ADMIN_ROLE, address(vaultManager), SimpleVaultManager.setPaused.selector, true
+        );
+        rolesAuthority.setRoleCapability(
+            ADMIN_ROLE, address(vaultManager), SimpleVaultManager.rescueTokens.selector, true
         );
 
         vm.stopPrank();
@@ -112,7 +129,7 @@ contract SimpleVaultManagerTest is Test {
     // ========================= SUPPLY =========================
 
     function test_supplyToAave() public {
-        vm.prank(manager);
+        vm.prank(operator);
         vaultManager.supplyToAave(5_000e6);
 
         assertEq(aUsdc.balanceOf(address(vault)), 5_000e6);
@@ -120,7 +137,7 @@ contract SimpleVaultManagerTest is Test {
     }
 
     function test_supplyToAave_fullBalance() public {
-        vm.prank(manager);
+        vm.prank(operator);
         vaultManager.supplyToAave(10_000e6);
 
         assertEq(aUsdc.balanceOf(address(vault)), 10_000e6);
@@ -128,23 +145,27 @@ contract SimpleVaultManagerTest is Test {
     }
 
     function test_supplyToAave_emitsEvent() public {
-        vm.prank(manager);
+        vm.prank(operator);
         vm.expectEmit(true, true, true, true);
         emit SuppliedToAave(5_000e6);
         vaultManager.supplyToAave(5_000e6);
     }
 
+    function test_supplyToAave_resetsApproval() public {
+        vm.prank(operator);
+        vaultManager.supplyToAave(5_000e6);
+
+        // After supply, the vault's USDC allowance to the Aave pool should be zero
+        assertEq(usdc.allowance(address(vault), address(aavePool)), 0);
+    }
+
     // ========================= WITHDRAW =========================
 
     function test_withdrawFromAave() public {
-        vm.prank(manager);
+        vm.prank(operator);
         vaultManager.supplyToAave(10_000e6);
 
-        // Approve aUSDC for the pool to burn
-        vm.prank(address(vault));
-        aUsdc.approve(address(aavePool), type(uint256).max);
-
-        vm.prank(manager);
+        vm.prank(operator);
         uint256 actual = vaultManager.withdrawFromAave(3_000e6);
 
         assertEq(actual, 3_000e6);
@@ -153,26 +174,20 @@ contract SimpleVaultManagerTest is Test {
     }
 
     function test_withdrawFromAave_emitsEvent() public {
-        vm.prank(manager);
+        vm.prank(operator);
         vaultManager.supplyToAave(10_000e6);
 
-        vm.prank(address(vault));
-        aUsdc.approve(address(aavePool), type(uint256).max);
-
-        vm.prank(manager);
+        vm.prank(operator);
         vm.expectEmit(true, true, true, true);
         emit WithdrawnFromAave(3_000e6);
         vaultManager.withdrawFromAave(3_000e6);
     }
 
     function test_withdrawAllFromAave() public {
-        vm.prank(manager);
+        vm.prank(operator);
         vaultManager.supplyToAave(10_000e6);
 
-        vm.prank(address(vault));
-        aUsdc.approve(address(aavePool), type(uint256).max);
-
-        vm.prank(manager);
+        vm.prank(operator);
         uint256 actual = vaultManager.withdrawAllFromAave();
 
         assertEq(actual, 10_000e6);
@@ -180,24 +195,119 @@ contract SimpleVaultManagerTest is Test {
         assertEq(aUsdc.balanceOf(address(vault)), 0);
     }
 
-    // ========================= SUPPLY THEN WITHDRAW ROUND TRIP =========================
+    function test_withdrawAllFromAave_revertsOnZeroBalance() public {
+        // No supply -- vault has no Aave position
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSignature("SimpleVaultManager__NothingToWithdraw()"));
+        vaultManager.withdrawAllFromAave();
+    }
+
+    // ========================= ROUND TRIP =========================
 
     function test_roundTrip() public {
         // Supply all
-        vm.prank(manager);
+        vm.prank(operator);
         vaultManager.supplyToAave(10_000e6);
         assertEq(usdc.balanceOf(address(vault)), 0);
         assertEq(aUsdc.balanceOf(address(vault)), 10_000e6);
 
-        // Approve for withdraw
-        vm.prank(address(vault));
-        aUsdc.approve(address(aavePool), type(uint256).max);
-
-        // Withdraw all
-        vm.prank(manager);
+        // Withdraw all -- no manual aToken approval needed (matches real Aave)
+        vm.prank(operator);
         vaultManager.withdrawAllFromAave();
         assertEq(usdc.balanceOf(address(vault)), 10_000e6);
         assertEq(aUsdc.balanceOf(address(vault)), 0);
+    }
+
+    // ========================= PAUSE =========================
+
+    function test_pause_blocksSupply() public {
+        vm.prank(admin);
+        vaultManager.setPaused(true);
+
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSignature("SimpleVaultManager__Paused()"));
+        vaultManager.supplyToAave(1_000e6);
+    }
+
+    function test_pause_blocksWithdraw() public {
+        vm.prank(operator);
+        vaultManager.supplyToAave(5_000e6);
+
+        vm.prank(admin);
+        vaultManager.setPaused(true);
+
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSignature("SimpleVaultManager__Paused()"));
+        vaultManager.withdrawFromAave(1_000e6);
+    }
+
+    function test_pause_blocksWithdrawAll() public {
+        vm.prank(operator);
+        vaultManager.supplyToAave(5_000e6);
+
+        vm.prank(admin);
+        vaultManager.setPaused(true);
+
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSignature("SimpleVaultManager__Paused()"));
+        vaultManager.withdrawAllFromAave();
+    }
+
+    function test_unpause_allowsOperations() public {
+        vm.prank(admin);
+        vaultManager.setPaused(true);
+
+        vm.prank(admin);
+        vaultManager.setPaused(false);
+
+        vm.prank(operator);
+        vaultManager.supplyToAave(1_000e6);
+        assertEq(aUsdc.balanceOf(address(vault)), 1_000e6);
+    }
+
+    function test_pause_emitsEvent() public {
+        vm.prank(admin);
+        vm.expectEmit(true, true, true, true);
+        emit PauseToggled(true);
+        vaultManager.setPaused(true);
+    }
+
+    // ========================= RESCUE =========================
+
+    function test_rescueTokens() public {
+        // Accidentally send USDC to the manager contract
+        usdc.mint(address(vaultManager), 500e6);
+
+        vm.prank(admin);
+        vaultManager.rescueTokens(address(usdc), admin, 500e6);
+
+        assertEq(usdc.balanceOf(admin), 500e6);
+        assertEq(usdc.balanceOf(address(vaultManager)), 0);
+    }
+
+    function test_rescueTokens_emitsEvent() public {
+        usdc.mint(address(vaultManager), 100e6);
+
+        vm.prank(admin);
+        vm.expectEmit(true, true, true, true);
+        emit Rescued(address(usdc), admin, 100e6);
+        vaultManager.rescueTokens(address(usdc), admin, 100e6);
+    }
+
+    function test_revert_rescueUnauthorized() public {
+        usdc.mint(address(vaultManager), 100e6);
+
+        vm.prank(operator);
+        vm.expectRevert("UNAUTHORIZED");
+        vaultManager.rescueTokens(address(usdc), operator, 100e6);
+    }
+
+    function test_revert_rescueZeroAddress() public {
+        usdc.mint(address(vaultManager), 100e6);
+
+        vm.prank(admin);
+        vm.expectRevert(abi.encodeWithSignature("SimpleVaultManager__ZeroAddress()"));
+        vaultManager.rescueTokens(address(usdc), address(0), 100e6);
     }
 
     // ========================= ACCESS CONTROL =========================
@@ -220,16 +330,35 @@ contract SimpleVaultManagerTest is Test {
         vaultManager.withdrawAllFromAave();
     }
 
+    function test_revert_unauthorizedPause() public {
+        vm.prank(operator);
+        vm.expectRevert("UNAUTHORIZED");
+        vaultManager.setPaused(true);
+    }
+
+    function test_adminCannotSupply() public {
+        // Admin role should NOT be able to call operator functions
+        vm.prank(admin);
+        vm.expectRevert("UNAUTHORIZED");
+        vaultManager.supplyToAave(1_000e6);
+    }
+
+    function test_operatorCannotPause() public {
+        vm.prank(operator);
+        vm.expectRevert("UNAUTHORIZED");
+        vaultManager.setPaused(true);
+    }
+
     // ========================= INPUT VALIDATION =========================
 
     function test_revert_supplyZero() public {
-        vm.prank(manager);
+        vm.prank(operator);
         vm.expectRevert(abi.encodeWithSignature("SimpleVaultManager__ZeroAmount()"));
         vaultManager.supplyToAave(0);
     }
 
     function test_revert_withdrawZero() public {
-        vm.prank(manager);
+        vm.prank(operator);
         vm.expectRevert(abi.encodeWithSignature("SimpleVaultManager__ZeroAmount()"));
         vaultManager.withdrawFromAave(0);
     }
@@ -239,21 +368,37 @@ contract SimpleVaultManagerTest is Test {
     function test_revert_zeroAddressVault() public {
         vm.expectRevert(abi.encodeWithSignature("SimpleVaultManager__ZeroAddress()"));
         new SimpleVaultManager(
-            owner, rolesAuthority, BoringVault(payable(address(0))), address(usdc), address(aavePool)
+            rolesAuthority, BoringVault(payable(address(0))), address(usdc), address(aavePool)
         );
     }
 
     function test_revert_zeroAddressUsdc() public {
         vm.expectRevert(abi.encodeWithSignature("SimpleVaultManager__ZeroAddress()"));
         new SimpleVaultManager(
-            owner, rolesAuthority, vault, address(0), address(aavePool)
+            rolesAuthority, vault, address(0), address(aavePool)
         );
     }
 
     function test_revert_zeroAddressPool() public {
         vm.expectRevert(abi.encodeWithSignature("SimpleVaultManager__ZeroAddress()"));
         new SimpleVaultManager(
-            owner, rolesAuthority, vault, address(usdc), address(0)
+            rolesAuthority, vault, address(usdc), address(0)
         );
+    }
+
+    // ========================= FUZZ =========================
+
+    function testFuzz_supplyAndWithdraw(uint256 supplyAmount, uint256 withdrawAmount) public {
+        supplyAmount = bound(supplyAmount, 1, 10_000e6);
+        withdrawAmount = bound(withdrawAmount, 1, supplyAmount);
+
+        vm.prank(operator);
+        vaultManager.supplyToAave(supplyAmount);
+
+        vm.prank(operator);
+        vaultManager.withdrawFromAave(withdrawAmount);
+
+        assertEq(usdc.balanceOf(address(vault)), 10_000e6 - supplyAmount + withdrawAmount);
+        assertEq(aUsdc.balanceOf(address(vault)), supplyAmount - withdrawAmount);
     }
 }

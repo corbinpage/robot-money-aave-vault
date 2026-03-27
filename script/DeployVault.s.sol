@@ -19,38 +19,39 @@ contract DeployVault is Script {
 
     // ========================= ROLE IDs =========================
 
-    uint8 constant VAULT_MANAGER_ROLE = 1;
-    uint8 constant OWNER_ROLE = 8;
+    uint8 constant VAULT_MANAGER_ROLE = 1;  // SimpleVaultManager -> vault.manage()
+    uint8 constant OPERATOR_ROLE = 8;       // Manager EOA -> supply/withdraw
+    uint8 constant ADMIN_ROLE = 9;          // Admin EOA -> pause, rescue
 
     function run() external {
         address deployer = msg.sender;
 
-        address owner = vm.envOr("OWNER", deployer);
-        address manager = vm.envOr("MANAGER", deployer);
+        // Required env vars -- revert if unset to prevent accidental deployer-as-owner
+        address owner = vm.envAddress("OWNER");
+        address operator = vm.envAddress("OPERATOR");
 
         vm.startBroadcast();
 
-        // 1. Deploy RolesAuthority
+        // 1. Deploy RolesAuthority (deployer is initial owner for setup, transferred later)
         RolesAuthority rolesAuthority = new RolesAuthority(deployer, Authority(address(0)));
         console.log("RolesAuthority:", address(rolesAuthority));
 
-        // 2. Deploy BoringVault
+        // 2. Deploy BoringVault (deployer is initial owner so we can setAuthority)
         BoringVault vault = new BoringVault(deployer, "Robot Money Aave Vault", "rmUSDC", 6);
         console.log("BoringVault:", address(vault));
 
         // 3. Set vault authority
         vault.setAuthority(rolesAuthority);
 
-        // 4. Deploy SimpleVaultManager
+        // 4. Deploy SimpleVaultManager (no Auth owner -- access is purely role-based)
         SimpleVaultManager vaultManager = new SimpleVaultManager(
-            owner, rolesAuthority, vault, USDC, AAVE_V3_POOL
+            rolesAuthority, vault, USDC, AAVE_V3_POOL
         );
         console.log("SimpleVaultManager:", address(vaultManager));
 
         // ========================= ROLE CONFIGURATION =========================
 
         // --- SimpleVaultManager gets VAULT_MANAGER_ROLE on the vault ---
-        // This allows it to call vault.manage()
         rolesAuthority.setUserRole(address(vaultManager), VAULT_MANAGER_ROLE, true);
         rolesAuthority.setRoleCapability(
             VAULT_MANAGER_ROLE,
@@ -59,27 +60,43 @@ contract DeployVault is Script {
             true
         );
 
-        // --- Manager EOA gets OWNER_ROLE to call supplyToAave / withdrawFromAave ---
-        rolesAuthority.setUserRole(manager, OWNER_ROLE, true);
+        // --- Operator EOA gets OPERATOR_ROLE to call supplyToAave / withdrawFromAave ---
+        rolesAuthority.setUserRole(operator, OPERATOR_ROLE, true);
         rolesAuthority.setRoleCapability(
-            OWNER_ROLE,
+            OPERATOR_ROLE,
             address(vaultManager),
             SimpleVaultManager.supplyToAave.selector,
             true
         );
         rolesAuthority.setRoleCapability(
-            OWNER_ROLE,
+            OPERATOR_ROLE,
             address(vaultManager),
             SimpleVaultManager.withdrawFromAave.selector,
             true
         );
         rolesAuthority.setRoleCapability(
-            OWNER_ROLE,
+            OPERATOR_ROLE,
             address(vaultManager),
             SimpleVaultManager.withdrawAllFromAave.selector,
             true
         );
-        console.log("Manager role granted to:", manager);
+        console.log("Operator role granted to:", operator);
+
+        // --- Owner gets ADMIN_ROLE for pause and rescue ---
+        rolesAuthority.setUserRole(owner, ADMIN_ROLE, true);
+        rolesAuthority.setRoleCapability(
+            ADMIN_ROLE,
+            address(vaultManager),
+            SimpleVaultManager.setPaused.selector,
+            true
+        );
+        rolesAuthority.setRoleCapability(
+            ADMIN_ROLE,
+            address(vaultManager),
+            SimpleVaultManager.rescueTokens.selector,
+            true
+        );
+        console.log("Admin role granted to:", owner);
 
         // --- Transfer ownership from deployer to owner ---
         vault.transferOwnership(owner);
@@ -90,14 +107,15 @@ contract DeployVault is Script {
         console.log("");
         console.log("=== Deployment Summary ===");
         console.log("Owner:", owner);
-        console.log("Manager:", manager);
+        console.log("Operator:", operator);
         console.log("");
-        console.log("Access chain: Manager EOA -> SimpleVaultManager -> BoringVault -> Aave");
-        console.log("The manager can ONLY supply/withdraw USDC to/from Aave.");
+        console.log("Access chain: Operator EOA -> SimpleVaultManager -> BoringVault -> Aave");
+        console.log("The operator can ONLY supply/withdraw USDC to/from Aave.");
+        console.log("The admin can pause operations and rescue stuck tokens.");
         console.log("");
         console.log("Next steps:");
         console.log("1. Deploy Teller + Accountant via Veda Arctic Architecture");
         console.log("2. Configure Teller to accept USDC deposits");
-        console.log("3. Manager calls supplyToAave() to deploy vault USDC into Aave");
+        console.log("3. Operator calls supplyToAave() to deploy vault USDC into Aave");
     }
 }

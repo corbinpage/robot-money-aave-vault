@@ -12,7 +12,7 @@ A minimal DeFi vault built on [Veda's Boring Vault](https://github.com/Se7en-Sea
          |                           |
          v                           v
 +----------------+          +-------------------+
-|  BoringVault   |<---------|  SimpleVault      |<-- Manager EOA
+|  BoringVault   |<---------|  SimpleVault      |<-- Operator EOA
 |   (rmUSDC)     |          |     Manager       |
 |                |          |                   |
 | holds USDC     |  manage  | VAULT_MANAGER_ROLE|
@@ -33,9 +33,9 @@ A minimal DeFi vault built on [Veda's Boring Vault](https://github.com/Se7en-Sea
 ### How It Works
 
 1. **Users deposit USDC** via the Veda Teller, receiving `rmUSDC` vault shares
-2. **Manager calls `supplyToAave()`** to move the vault's idle USDC into Aave V3, earning yield
+2. **Operator calls `supplyToAave()`** to move the vault's idle USDC into Aave V3, earning yield
 3. **Aave yield accrues** as the vault's aUSDC balance grows over time
-4. **Manager calls `withdrawFromAave()`** when USDC liquidity is needed (e.g., for user withdrawals)
+4. **Operator calls `withdrawFromAave()`** when USDC liquidity is needed (e.g., for user withdrawals)
 5. **Users withdraw** via the Teller, burning their `rmUSDC` shares for USDC
 
 ## Contracts
@@ -53,33 +53,44 @@ A tightly scoped manager that holds `VAULT_MANAGER_ROLE` on the vault but only e
 
 | Function | What it does |
 |---|---|
-| `supplyToAave(amount)` | Approves Aave pool, then calls `Pool.supply(USDC, amount, vault, 0)` |
+| `supplyToAave(amount)` | Approves Aave pool, calls `Pool.supply(USDC, amount, vault, 0)`, then resets approval to zero |
 | `withdrawFromAave(amount)` | Calls `Pool.withdraw(USDC, amount, vault)` — reverts if Aave returns less than requested |
-| `withdrawAllFromAave()` | Calls `Pool.withdraw(USDC, type(uint256).max, vault)` — withdraws entire Aave position |
+| `withdrawAllFromAave()` | Calls `Pool.withdraw(USDC, type(uint256).max, vault)` — withdraws entire Aave position, reverts if zero |
 
-**Why a scoped manager?** Even if the manager EOA is compromised, the attacker can only supply/withdraw USDC to/from Aave — they cannot approve arbitrary spenders, transfer tokens to arbitrary addresses, or make arbitrary calls through the vault.
+**Why a scoped manager?** Even if the operator EOA is compromised, the attacker can only supply/withdraw USDC to/from Aave — they cannot approve arbitrary spenders, transfer tokens to arbitrary addresses, or make arbitrary calls through the vault.
+
+### Safety Features
+
+- **No Auth owner bypass** — the SimpleVaultManager is deployed with `address(0)` as Auth owner, so all access goes through the RolesAuthority role system exclusively
+- **Approval cleanup** — USDC approval to Aave is reset to zero after each supply, preventing lingering allowances
+- **Pause mechanism** — admin can call `setPaused(true)` to halt all supply/withdraw operations in an emergency
+- **Token rescue** — admin can recover ERC20 tokens accidentally sent to the manager contract via `rescueTokens()`
+- **Zero-balance guard** — `withdrawAllFromAave()` reverts if the vault has no Aave position
 
 ## Access Control
 
 ```
-Manager EOA
+Operator EOA
     |
     | supplyToAave(amount)
     | withdrawFromAave(amount)
     | withdrawAllFromAave()
     v
-SimpleVaultManager     [OWNER_ROLE required on manager]
+SimpleVaultManager     [OPERATOR_ROLE required]
     |
     | vault.manage(usdc, approve...)
     | vault.manage(aavePool, supply/withdraw...)
     v
-BoringVault            [VAULT_MANAGER_ROLE required on vault]
+BoringVault            [VAULT_MANAGER_ROLE required]
 ```
 
 | Role | ID | Assigned To | Can Call |
 |---|---|---|---|
 | `VAULT_MANAGER_ROLE` | 1 | SimpleVaultManager | `vault.manage()` |
-| `OWNER_ROLE` | 8 | Manager EOA | `supplyToAave`, `withdrawFromAave`, `withdrawAllFromAave` |
+| `OPERATOR_ROLE` | 8 | Operator EOA | `supplyToAave`, `withdrawFromAave`, `withdrawAllFromAave` |
+| `ADMIN_ROLE` | 9 | Admin EOA | `setPaused`, `rescueTokens` |
+
+Operator and admin roles are separated — the operator cannot pause, and the admin cannot supply/withdraw. This limits blast radius if either key is compromised.
 
 ## Base Addresses
 
@@ -106,9 +117,9 @@ forge test -vvv
 ### Deploy
 
 ```bash
-# Set environment variables
+# Required environment variables (deploy reverts if unset)
 export OWNER=0x...
-export MANAGER=0x...
+export OPERATOR=0x...
 
 # Deploy to Base
 forge script script/DeployVault.s.sol --rpc-url base --broadcast
@@ -118,19 +129,7 @@ forge script script/DeployVault.s.sol --rpc-url base --broadcast
 
 1. Deploy Teller and Accountant via Veda's [Arctic Architecture](https://github.com/Se7en-Seas/boring-vault) tooling
 2. Configure the Teller to accept USDC deposits (no withdrawal queue)
-3. Manager calls `supplyToAave()` to deploy vault USDC into Aave V3
-
-## Comparison with ClawTogether
-
-This vault is a simplified version of [ClawTogether Contracts](https://github.com/corbinpage/clawtogether-contracts). The key differences:
-
-| Feature | Robot Money Aave Vault | ClawTogether |
-|---|---|---|
-| Aave supply/withdraw | Yes | Yes |
-| Game rewards distribution | No | Yes |
-| Custom fee splits | No | Yes (protocol/vault/winner) |
-| GameMaster role | No | Yes |
-| Contracts | 1 (SimpleVaultManager) | 2 (ScopedVaultProxy + GameRewardsDistributor) |
+3. Operator calls `supplyToAave()` to deploy vault USDC into Aave V3
 
 ## License
 
